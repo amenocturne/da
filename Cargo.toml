@@ -1,0 +1,24 @@
+[package]
+name = "dabin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "yes. — classify a bash command as approve/defer/deny under explicit policies"
+repository = "https://github.com/amenocturne/da"
+homepage = "https://github.com/amenocturne/da"
+readme = "README.md"
+keywords = ["shell", "bash", "permissions", "agent", "claude"]
+categories = ["command-line-utilities", "parsing"]
+
+[lib]
+name = "dabin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "da"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

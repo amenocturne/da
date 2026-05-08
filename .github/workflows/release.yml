@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create + release (e.g. v0.1.1). Created at the workflow's checked-out ref."
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    outputs:
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+      tag:    ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "could not resolve a tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $TAG"
+
+      - name: Create + push tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build release
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: bundle tarball
+        id: bundle
+        run: |
+          set -euo pipefail
+          DIST=da-aarch64-apple-darwin
+          TARGET_BIN=target/aarch64-apple-darwin/release
+
+          mkdir -p "$DIST/bin" "$DIST/share/da"
+          cp "$TARGET_BIN/da" "$DIST/bin/da"
+          cp LICENSE README.md "$DIST/share/da/"
+
+          tar -czf "$DIST.tar.gz" "$DIST"
+          SHA256=$(shasum -a 256 "$DIST.tar.gz" | awk '{print $1}')
+          printf '%s  %s\n' "$SHA256" "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
+
+          echo "tarball=$DIST.tar.gz"   >> "$GITHUB_OUTPUT"
+          echo "sha256_file=$DIST.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256"          >> "$GITHUB_OUTPUT"
+
+      - name: gh release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            ${{ steps.bundle.outputs.tarball }}
+            ${{ steps.bundle.outputs.sha256_file }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: cargo publish (crates.io)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # --allow-dirty: the prior `bundle tarball` step leaves CI artifacts
+        # (tarball + dist dir) in the working tree; they aren't part of the
+        # crate source.
+        run: cargo publish --locked --no-verify --allow-dirty
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: amenocturne/homebrew-tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - name: Update Formula/da.rb
+        env:
+          SHA256: ${{ needs.release.outputs.sha256 }}
+          TAG:    ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          URL="https://github.com/amenocturne/da/releases/download/${TAG}/da-aarch64-apple-darwin.tar.gz"
+          sed -i "s|^  url \".*\"|  url \"$URL\"|"           Formula/da.rb
+          sed -i "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|"  Formula/da.rb
+          sed -i "s|^  version \".*\"|  version \"$VERSION\"|" Formula/da.rb
+
+      - name: Commit + push
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet Formula/da.rb; then
+            echo "No formula changes; skipping commit."
+            exit 0
+          fi
+          git commit -am "Bump da to ${TAG}"
+          git push
