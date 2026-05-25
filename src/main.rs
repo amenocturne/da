@@ -5,11 +5,12 @@
 //! Code's hook protocol) live with the caller.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use dabin::policies::{self, HELP_BYPASS, MACOS_ONLY, MKDIR_CWD, READ_ONLY};
-use dabin::{classify, Decision, Policy};
+use dabin::{classify_with_ml, Decision, Policy, Segment, Verdict};
 
 const EXIT_APPROVE: u8 = 0;
 const EXIT_DEFER: u8 = 1;
@@ -38,17 +39,19 @@ fn run() -> Result<u8, String> {
     // Trim a single trailing newline (common with `printf '%s\n'` callers).
     let cmd = cmd.trim_end_matches('\n');
 
-    let decision = classify(cmd, parsed.path.as_deref(), &parsed.policies);
+    let decision = classify_with_ml(cmd, parsed.path.as_deref(), &parsed.policies);
     Ok(match decision {
         Decision::Approve => EXIT_APPROVE,
-        Decision::Defer => EXIT_DEFER,
-        Decision::Deny => EXIT_DENY,
+        Decision::Deny if parsed.autonomous => EXIT_DENY,
+        Decision::Defer if parsed.autonomous => EXIT_DENY,
+        Decision::Deny | Decision::Defer => EXIT_DEFER,
     })
 }
 
 struct Parsed {
     path: Option<PathBuf>,
     policies: Vec<&'static Policy>,
+    autonomous: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
@@ -65,6 +68,9 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
 
     let mut path: Option<PathBuf> = None;
     let mut policies: Vec<&'static Policy> = Vec::new();
+    let mut custom_rules: Vec<Vec<String>> = Vec::new();
+    let mut deny_patterns: Vec<String> = Vec::new();
+    let mut autonomous = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -104,14 +110,147 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 add_capabilities(&mut policies, "cargo", v)?;
                 i += 2;
             }
+            "--autonomous" => {
+                autonomous = true;
+                i += 1;
+            }
+            "--interactive" => {
+                i += 1;
+            }
+            "--allow" => {
+                let v = args.get(i + 1)
+                    .ok_or_else(|| "--allow requires a value".to_string())?;
+                let tokens: Vec<String> = v.split_whitespace().map(str::to_owned).collect();
+                if tokens.is_empty() {
+                    return Err("--allow value is empty".into());
+                }
+                custom_rules.push(tokens);
+                i += 2;
+            }
+            "--deny" => {
+                let v = args.get(i + 1)
+                    .ok_or_else(|| "--deny requires a value".to_string())?;
+                if v.is_empty() {
+                    return Err("--deny value is empty".into());
+                }
+                deny_patterns.push(v.clone());
+                i += 2;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
+    }
+
+    if !custom_rules.is_empty() {
+        CUSTOM_ALLOW_RULES
+            .set(custom_rules)
+            .map_err(|_| "internal: custom rules already initialised".to_string())?;
+        policies.push(&CUSTOM_ALLOW);
+    }
+
+    // Deny policies go first — they override allow policies.
+    if !deny_patterns.is_empty() {
+        CUSTOM_DENY_PATTERNS
+            .set(deny_patterns)
+            .map_err(|_| "internal: deny patterns already initialised".to_string())?;
+        policies.insert(0, &CUSTOM_DENY);
     }
 
     if policies.is_empty() {
         return Err("no policies enabled — pass at least one policy flag".into());
     }
-    Ok(Parsed { path, policies })
+    Ok(Parsed { path, policies, autonomous })
+}
+
+/// User-supplied token-prefix rules from `--allow`. Set once during arg
+/// parsing; read by [`custom_allow_verify`]. Each inner `Vec<String>` is a
+/// prefix of literal argv tokens — a segment approves if its argv starts
+/// with the same tokens.
+static CUSTOM_ALLOW_RULES: OnceLock<Vec<Vec<String>>> = OnceLock::new();
+
+/// Policy backing `--allow`. Stateless function pointer + global rule
+/// storage; the storage is process-local and set once before classify runs.
+static CUSTOM_ALLOW: Policy = Policy {
+    name: "custom-allow",
+    verify: custom_allow_verify,
+};
+
+/// User-supplied deny patterns from `--deny`. Set once during arg parsing;
+/// read by [`custom_deny_verify`]. Each string is a path component pattern —
+/// a segment denies if any argv token or redirect target contains a matching
+/// path component. Trailing `*` enables prefix matching.
+static CUSTOM_DENY_PATTERNS: OnceLock<Vec<String>> = OnceLock::new();
+
+static CUSTOM_DENY: Policy = Policy {
+    name: "custom-deny",
+    verify: custom_deny_verify,
+};
+
+fn custom_deny_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
+    let patterns = CUSTOM_DENY_PATTERNS.get()?;
+    for arg in &seg.argv {
+        if token_matches_deny(arg, patterns) {
+            return Some(Verdict::Deny);
+        }
+    }
+    for redir in &seg.redirects {
+        if token_matches_deny(&redir.target, patterns) {
+            return Some(Verdict::Deny);
+        }
+    }
+    None
+}
+
+fn token_matches_deny(token: &str, patterns: &[String]) -> bool {
+    let p = Path::new(token);
+    for pattern in patterns {
+        let (prefix, is_glob) = match pattern.strip_suffix('*') {
+            Some(p) => (p, true),
+            None => (pattern.as_str(), false),
+        };
+        for component in p.components() {
+            if let std::path::Component::Normal(c) = component {
+                let s = match c.to_str() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if is_glob {
+                    if s.starts_with(prefix) {
+                        return true;
+                    }
+                } else if s == prefix {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn custom_allow_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
+    let rules = CUSTOM_ALLOW_RULES.get()?;
+    if seg.argv.is_empty() {
+        return None;
+    }
+    let bin = argv0_basename(&seg.argv[0]);
+    for rule in rules {
+        if rule.len() > seg.argv.len() {
+            continue;
+        }
+        // First token matches by basename (so `/usr/bin/just` matches `just`)
+        // or by literal argv[0]; later tokens must match exactly.
+        let head_ok = bin == rule[0].as_str() || seg.argv[0] == rule[0];
+        if !head_ok {
+            continue;
+        }
+        if rule.iter().skip(1).zip(seg.argv.iter().skip(1)).all(|(r, a)| r == a) {
+            return Some(Verdict::Approve);
+        }
+    }
+    None
+}
+
+fn argv0_basename(s: &str) -> &str {
+    Path::new(s).file_name().and_then(|n| n.to_str()).unwrap_or(s)
 }
 
 fn add_capabilities(
@@ -147,12 +286,23 @@ fn print_usage() {
         --git    CAPS           git capabilities (csv): read,add,commit,\n  \
                                 restore-staged,tag,fetch,pull,push\n  \
         --cargo  CAPS           cargo capabilities (csv): local,\n  \
-                                crates-install,crates-publish\n\n\
+                                crates-install,crates-publish\n  \
+        --allow  CMD            token-prefix rule (repeatable). Approves any segment\n  \
+                                whose argv starts with CMD's tokens. Path components\n  \
+                                of argv[0] are stripped before matching.\n  \
+        --deny   PATTERN        path-component deny rule (repeatable). Denies any\n  \
+                                segment whose argv or redirect targets contain a\n  \
+                                matching path component. Trailing * = prefix match.\n  \
+                                Deny rules override allow rules.\n\n\
         examples:\n  \
         printf '%s' 'ls -la'         | da --read-only\n  \
         printf '%s' 'git status'     | da --git read\n  \
         printf '%s' 'git add foo.rs' | da --git read,add\n  \
-        printf '%s' 'mkdir foo'      | da --path /repo --mkdir-cwd\n",
+        printf '%s' 'mkdir foo'      | da --path /repo --mkdir-cwd\n  \
+        printf '%s' 'just test'      | da --allow 'just test'\n  \
+        printf '%s' 'npm run build'  | da --allow 'npm run'\n  \
+        printf '%s' 'cat .env'       | da --read-only --deny '.env*'\n  \
+        printf '%s' 'cat ~/.ssh/key' | da --read-only --deny .ssh\n",
         env!("CARGO_PKG_VERSION"),
     );
 }

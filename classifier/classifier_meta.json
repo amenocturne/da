@@ -1,0 +1,41 @@
+{
+  "labels": [
+    "safe",
+    "needs-approval",
+    "dangerous"
+  ],
+  "label2id": {
+    "safe": 0,
+    "needs-approval": 1,
+    "dangerous": 2
+  },
+  "id2label": {
+    "0": "safe",
+    "1": "needs-approval",
+    "2": "dangerous"
+  },
+  "temperature": 1.3366203308105469,
+  "energy_thresholds": {
+    "energy_p95": -2.543365240097046,
+    "energy_p99": -2.0081536769866943,
+    "energy_mean": -3.5741095542907715,
+    "energy_std": 0.50740647315979
+  },
+  "class_weights": {
+    "safe": 0.6471397280693054,
+    "needs-approval": 0.8553253412246704,
+    "dangerous": 3.501488208770752
+  },
+  "max_length": 128,
+  "base_model": "distilbert-base-uncased",
+  "train_size": 14118,
+  "val_size": 1569,
+  "test_size": 1743,
+  "epochs": 5,
+  "test_metrics": {
+    "f1_macro": 0.932728710810069,
+    "f1_weighted": 0.9384682718163184,
+    "precision_macro": 0.9323030404683427,
+    "recall_macro": 0.9333369769838397
+  }
+}

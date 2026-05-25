@@ -70,6 +70,12 @@ Some rules are always on, regardless of which policies you enable:
 Two shapes. **Bare flags** for capabilities with one knob. **Tool-scoped flags**
 with comma-separated capability lists where one binary has many ops.
 
+### Custom (repeatable)
+
+| Flag          | What it allows                                                                                                                                                                                                                                                                                                                |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--allow CMD` | Token-prefix rule. A segment approves if its argv starts with the same tokens as `CMD` (whitespace-split). Path components of argv[0] are stripped before matching, so `--allow just` matches both `just …` and `/usr/local/bin/just …`. Repeat the flag to add multiple rules. Use for project-specific runners (`just`, `npm run`, `make`, …). |
+
 ### Bare
 
 | Flag            | What it allows                                                                                                                                                                                                                                                                                                               |
@@ -149,6 +155,19 @@ printf 'mkdir -p /etc/foo'        | da --path /repo --mkdir-cwd
 
 ```sh
 printf 'terraform --help' | da --help-bypass
+# → exit 0
+```
+
+Project-specific runners via `--allow`
+
+```sh
+printf 'just test --watch' | da --allow 'just test'
+# → exit 0
+printf 'just build'        | da --allow 'just test'
+# → exit 1  (prefix doesn't match)
+
+# Repeat the flag for multiple runners
+printf 'just lint && npm run build' | da --allow just --allow 'npm run'
 # → exit 0
 ```
 

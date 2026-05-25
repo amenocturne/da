@@ -1,0 +1,37 @@
+set positional-arguments
+
+default:
+    @just --list
+
+# Extract bash commands from Claude Code session logs
+extract logs_dir *FLAGS:
+    uv run scripts/extract-commands.py "{{ logs_dir }}" "$@"
+
+# Extract commands from shparse test corpus
+extract-corpus corpus_dir *FLAGS:
+    uv run scripts/extract-corpus.py "{{ corpus_dir }}" "$@"
+
+# Sanitize commands for public release (strip PII)
+sanitize *FLAGS:
+    uv run scripts/sanitize-commands.py "$@"
+
+# Merge labeled chunks after Claude Code labeling pass
+merge-labels *FLAGS:
+    uv run scripts/merge-chunks.py -i data/labeled -o data/labeled.jsonl "$@"
+
+# Apply PII fixes from labeling pass
+apply-pii-fixes *FLAGS:
+    uv run scripts/apply-pii-fixes.py "$@"
+
+# Train the classifier (~40 min on M3 Max 64GB)
+train *FLAGS:
+    uv run scripts/train.py "$@"
+
+# Export trained model to ONNX with INT8 quantization
+export *FLAGS:
+    uv run scripts/export-onnx.py "$@"
+
+# Train + export in one shot (the overnight command)
+train-and-export:
+    just train -i data/training-dataset.jsonl -o models/classifier
+    just export -i models/classifier -o models/classifier-onnx

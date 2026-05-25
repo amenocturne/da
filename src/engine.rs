@@ -23,12 +23,20 @@ const SAFE_REDIRECT_TARGETS: &[&str] = &[
 /// policy wins. The whole command approves only if every segment approves;
 /// any `Deny` denies the whole command; anything unmatched defers.
 pub fn classify(cmd: &str, path: Option<&Path>, policies: &[&Policy]) -> Decision {
+    classify_inner(cmd, path, policies, false)
+}
+
+pub fn classify_with_ml(cmd: &str, path: Option<&Path>, policies: &[&Policy]) -> Decision {
+    classify_inner(cmd, path, policies, true)
+}
+
+fn classify_inner(cmd: &str, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
     let segs = match parse(cmd) {
         Ok(s) if !s.is_empty() => s,
         _ => return Decision::Defer,
     };
     for seg in &segs {
-        match classify_segment(seg, path, policies) {
+        match classify_segment(seg, path, policies, use_ml) {
             Decision::Approve => continue,
             other => return other,
         }
@@ -36,7 +44,7 @@ pub fn classify(cmd: &str, path: Option<&Path>, policies: &[&Policy]) -> Decisio
     Decision::Approve
 }
 
-fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) -> Decision {
+fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
     if !seg.redirects.iter().all(is_redirect_safe) {
         return Decision::Defer;
     }
@@ -52,10 +60,10 @@ fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) ->
         return Decision::Defer;
     }
     if binary == "env" {
-        return classify_env(seg, path, policies);
+        return classify_env(seg, path, policies, use_ml);
     }
     if binary == "time" {
-        return classify_time(seg, path, policies);
+        return classify_time(seg, path, policies, use_ml);
     }
     for p in policies {
         if let Some(v) = (p.verify)(seg, path) {
@@ -65,10 +73,13 @@ fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) ->
             };
         }
     }
+    if use_ml {
+        return crate::classifier::classify_command(&seg.argv.join(" "));
+    }
     Decision::Defer
 }
 
-fn classify_env(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) -> Decision {
+fn classify_env(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
     // argv looks like ["env", flags*, VAR=val*, <binary>, args...]
     let argv = &seg.argv;
     let mut i = 1;
@@ -90,10 +101,10 @@ fn classify_env(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) -> Dec
         redirects: Vec::new(),
         follows: Separator::End,
     };
-    classify_segment(&wrapped, path, policies)
+    classify_segment(&wrapped, path, policies, use_ml)
 }
 
-fn classify_time(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) -> Decision {
+fn classify_time(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
     let argv = &seg.argv;
     let mut i = 1;
     while i < argv.len() && argv[i].starts_with('-') {
@@ -108,7 +119,7 @@ fn classify_time(seg: &Segment, path: Option<&Path>, policies: &[&Policy]) -> De
         redirects: seg.redirects.clone(),
         follows: Separator::End,
     };
-    classify_segment(&wrapped, path, policies)
+    classify_segment(&wrapped, path, policies, use_ml)
 }
 
 /// Strip directory components from a path-like argv[0] to get the binary name.

@@ -149,6 +149,70 @@ fn pipeline_all_segments_must_approve() {
 }
 
 #[test]
+fn allow_single_token_approves_any_args() {
+    let o = run(&["--allow", "just"], "just test");
+    assert_eq!(o.code, 0, "stderr: {}", o.stderr);
+    let o = run(&["--allow", "just"], "just build --release");
+    assert_eq!(o.code, 0);
+    let o = run(&["--allow", "just"], "make build");
+    assert_eq!(o.code, 1);
+}
+
+#[test]
+fn allow_token_prefix_restricts() {
+    let o = run(&["--allow", "npm run"], "npm run build");
+    assert_eq!(o.code, 0);
+    let o = run(&["--allow", "npm run"], "npm run test --watch");
+    assert_eq!(o.code, 0);
+    let o = run(&["--allow", "npm run"], "npm install");
+    assert_eq!(o.code, 1);
+    let o = run(&["--allow", "npm run"], "npm");
+    assert_eq!(o.code, 1);
+}
+
+#[test]
+fn allow_repeatable() {
+    let o = run(
+        &["--allow", "just", "--allow", "npm run"],
+        "just test && npm run build",
+    );
+    assert_eq!(o.code, 0, "stderr: {}", o.stderr);
+    let o = run(
+        &["--allow", "just", "--allow", "npm run"],
+        "npm install",
+    );
+    assert_eq!(o.code, 1);
+}
+
+#[test]
+fn allow_strips_argv0_path_components() {
+    let o = run(&["--allow", "just"], "/usr/local/bin/just test");
+    assert_eq!(o.code, 0);
+}
+
+#[test]
+fn allow_composes_with_built_ins() {
+    let o = run(
+        &["--read-only", "--allow", "just test"],
+        "ls && just test",
+    );
+    assert_eq!(o.code, 0);
+}
+
+#[test]
+fn allow_empty_value_is_usage_error() {
+    let o = run(&["--allow", "   "], "ls");
+    assert_eq!(o.code, 64);
+    assert!(o.stderr.contains("empty"));
+}
+
+#[test]
+fn allow_missing_value_is_usage_error() {
+    let o = run(&["--allow"], "ls");
+    assert_eq!(o.code, 64);
+}
+
+#[test]
 fn cd_compound_with_git_local() {
     let o = run(
         &["--git", "read,add,commit"],

@@ -6,12 +6,13 @@
 //! crate directly and use [`classify`] with whichever [`Policy`] values
 //! they like (built-ins from [`policies`] or their own).
 
+pub mod classifier;
 pub mod policies;
 pub mod shparse;
 
 mod engine;
 
-pub use engine::classify;
+pub use engine::{classify, classify_with_ml};
 pub use shparse::{parse, Bail, RedirOp, Redirect, Segment, Separator};
 
 use std::path::Path;
