@@ -1,4 +1,5 @@
 /target
+/result
 Cargo.lock.bak
 *.swp
 .DS_Store
