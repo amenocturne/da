@@ -2,15 +2,13 @@
   description = "da - yes. — classify a bash command as approve/defer/deny under explicit policies";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      nixpkgs-unstable,
     }:
     let
       systems = [
@@ -27,7 +25,7 @@
         pkgs:
         let
           inherit (pkgs) lib;
-          onnxruntime = nixpkgs-unstable.legacyPackages.${pkgs.stdenv.hostPlatform.system}.onnxruntime;
+          onnxruntime = nixpkgs.legacyPackages.${pkgs.stdenv.hostPlatform.system}.onnxruntime;
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = cargoToml.package.name;
