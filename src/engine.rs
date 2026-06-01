@@ -3,9 +3,9 @@
 //!
 //! Structural rules (always applied, regardless of which policies are
 //! enabled): bash parser bails → `Defer`; bare assignments and `cd` →
-//! `Approve`; shell binaries (`bash`, `sh`, `zsh`, …) → `Defer`; redirect
-//! targets must be in [`SAFE_REDIRECT_TARGETS`]; `env` and `time` recurse
-//! into the wrapped command.
+//! `Approve`; Python tooling → `Defer`; shell `-c`, `env`, `command`, and
+//! `time` recurse into the wrapped command; redirect targets must be in
+//! [`SAFE_REDIRECT_TARGETS`].
 
 use std::path::Path;
 
@@ -14,9 +14,19 @@ use crate::{Decision, Policy, Verdict};
 
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "ksh", "csh", "tcsh", "fish", "dash"];
 
+const PYTHON_TOOLS: &[&str] = &[
+    "python", "python3", "pypy", "ipython", "uv", "uvx", "pip", "pipx", "pipenv", "poetry",
+    "hatch", "rye", "pixi", "conda", "mamba", "pytest", "tox", "nox",
+];
+
 const SAFE_REDIRECT_TARGETS: &[&str] = &[
-    "/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin",
-    "1", "2", "-",
+    "/dev/null",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/stdin",
+    "1",
+    "2",
+    "-",
 ];
 
 /// Parse `cmd`, then for each segment ask the policy stack — first matching
@@ -44,7 +54,12 @@ fn classify_inner(cmd: &str, path: Option<&Path>, policies: &[&Policy], use_ml: 
     Decision::Approve
 }
 
-fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
+fn classify_segment(
+    seg: &Segment,
+    path: Option<&Path>,
+    policies: &[&Policy],
+    use_ml: bool,
+) -> Decision {
     if !seg.redirects.iter().all(is_redirect_safe) {
         return Decision::Defer;
     }
@@ -56,8 +71,14 @@ fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy], us
     if binary == "cd" {
         return Decision::Approve;
     }
-    if SHELLS.contains(&binary) {
+    if is_python_tool(binary) {
         return Decision::Defer;
+    }
+    if SHELLS.contains(&binary) {
+        return classify_shell(seg, path, policies, use_ml);
+    }
+    if binary == "command" {
+        return classify_command_wrapper(seg, path, policies, use_ml);
     }
     if binary == "env" {
         return classify_env(seg, path, policies, use_ml);
@@ -79,7 +100,50 @@ fn classify_segment(seg: &Segment, path: Option<&Path>, policies: &[&Policy], us
     Decision::Defer
 }
 
-fn classify_env(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
+fn classify_shell(
+    seg: &Segment,
+    path: Option<&Path>,
+    policies: &[&Policy],
+    use_ml: bool,
+) -> Decision {
+    if let Some(command) = shell_c_arg(&seg.argv) {
+        classify_inner(command, path, policies, use_ml)
+    } else if use_ml {
+        crate::classifier::classify_command(&seg.argv.join(" "))
+    } else {
+        Decision::Defer
+    }
+}
+
+fn classify_command_wrapper(
+    seg: &Segment,
+    path: Option<&Path>,
+    policies: &[&Policy],
+    use_ml: bool,
+) -> Decision {
+    let argv = &seg.argv;
+    let mut i = 1;
+    while i < argv.len() && argv[i].starts_with('-') {
+        i += 1;
+    }
+    if i >= argv.len() {
+        return Decision::Approve;
+    }
+    let wrapped = Segment {
+        assigns: Vec::new(),
+        argv: argv[i..].to_vec(),
+        redirects: Vec::new(),
+        follows: Separator::End,
+    };
+    classify_segment(&wrapped, path, policies, use_ml)
+}
+
+fn classify_env(
+    seg: &Segment,
+    path: Option<&Path>,
+    policies: &[&Policy],
+    use_ml: bool,
+) -> Decision {
     // argv looks like ["env", flags*, VAR=val*, <binary>, args...]
     let argv = &seg.argv;
     let mut i = 1;
@@ -104,7 +168,12 @@ fn classify_env(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml
     classify_segment(&wrapped, path, policies, use_ml)
 }
 
-fn classify_time(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_ml: bool) -> Decision {
+fn classify_time(
+    seg: &Segment,
+    path: Option<&Path>,
+    policies: &[&Policy],
+    use_ml: bool,
+) -> Decision {
     let argv = &seg.argv;
     let mut i = 1;
     while i < argv.len() && argv[i].starts_with('-') {
@@ -124,7 +193,10 @@ fn classify_time(seg: &Segment, path: Option<&Path>, policies: &[&Policy], use_m
 
 /// Strip directory components from a path-like argv[0] to get the binary name.
 pub(crate) fn argv0_name(s: &str) -> &str {
-    Path::new(s).file_name().and_then(|n| n.to_str()).unwrap_or(s)
+    Path::new(s)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(s)
 }
 
 fn is_redirect_safe(r: &Redirect) -> bool {
@@ -137,6 +209,30 @@ fn is_env_assignment(s: &str) -> bool {
     !name.is_empty()
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_python_tool(binary: &str) -> bool {
+    PYTHON_TOOLS.contains(&binary)
+        || binary.starts_with("python")
+        || binary.starts_with("pypy")
+        || binary.starts_with("ipython")
+        || binary.starts_with("pip")
+}
+
+fn shell_c_arg(argv: &[String]) -> Option<&str> {
+    let mut i = 1;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        if arg == "-c" || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c')) {
+            return argv.get(i + 1).map(String::as_str);
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return None;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -165,10 +261,32 @@ mod tests {
     }
 
     #[test]
-    fn shell_binaries_defer() {
-        assert!(deferred("bash -c 'echo hi'"));
+    fn shell_c_recurses_into_inner_command() {
+        assert!(approved("bash -c 'echo hi'"));
+        assert!(approved("bash -lc 'echo hi'"));
         assert!(deferred("sh script.sh"));
-        assert!(deferred("zsh -c 'echo'"));
+        assert!(approved("zsh -c 'echo'"));
+    }
+
+    #[test]
+    fn python_tools_defer() {
+        for bin in PYTHON_TOOLS {
+            assert!(deferred(&format!("{bin} --version")));
+        }
+        assert!(deferred("/usr/bin/python -c 'print(1)'"));
+        assert!(deferred("env python -c 'print(1)'"));
+        assert!(deferred("command python -m json.tool file.json"));
+        assert!(deferred("bash -c 'python -c print(1)'"));
+        assert!(deferred("bash -lc 'python -V'"));
+        assert!(deferred("sh -c 'uv run script.py'"));
+        assert!(deferred("pip3 install foo"));
+        assert!(deferred("pypy3 script.py"));
+    }
+
+    #[test]
+    fn read_only_commands_still_approve() {
+        assert!(approved("ls -la"));
+        assert!(approved("cat README.md | head -20"));
     }
 
     #[test]
