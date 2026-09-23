@@ -16,7 +16,10 @@ if [[ "$("${binary}" --version)" != "da ${version}" ]]; then
 fi
 
 printf 'ls -la' | "${binary}" --read-only
-printf 'echo hello' | "${binary}" --autonomous --allow __da_release_smoke_never_match__
+if ! printf 'ls -la' | "${binary}" --autonomous --allow __da_release_smoke_never_match__; then
+  echo "embedded ML classifier did not approve the known-safe smoke command" >&2
+  exit 1
+fi
 
 if LC_ALL=C grep -a -q 'version https://git-lfs.github.com/spec/v1' "${binary}"; then
   echo "release binary contains a Git LFS pointer" >&2
