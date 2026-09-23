@@ -18,17 +18,30 @@
 
 ## Install
 
-From cargo:
+Prebuilt binaries:
 
 ```sh
-cargo install dabin
+# Download the archive for your platform from:
+# https://github.com/amenocturne/da/releases/latest
+tar -xzf da-aarch64-apple-darwin.tar.gz
+mkdir -p "$HOME/.local/bin"
+install da-aarch64-apple-darwin/bin/da "$HOME/.local/bin/da"
 ```
+
+Releases provide self-contained binaries for Apple Silicon macOS, x86_64
+Linux, and ARM64 Linux. The model, tokenizer, and ONNX Runtime are embedded;
+using a release does not require Rust, Git LFS, a source checkout, or a network
+connection. Linux binaries target glibc 2.35 (Ubuntu 22.04). The x86_64 Linux
+binary requires an x86-64-v3 CPU (Intel Haswell or AMD Excavator/Zen or newer).
+Intel macOS is not supported by the upstream ONNX Runtime used by `da`.
 
 From source:
 
 ```sh
 git clone https://github.com/amenocturne/da
-cd da && cargo install --path .
+cd da
+git lfs pull
+cargo install --path .
 ```
 
 From brew:

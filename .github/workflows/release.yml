@@ -1,13 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to create + release (e.g. v0.1.1). Created at the workflow's checked-out ref."
+        description: "Version tag to publish (for example, v0.2.1)"
         required: true
         type: string
 
@@ -17,93 +14,169 @@ env:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
-  release:
-    runs-on: macos-14
+  validate:
+    runs-on: ubuntu-22.04
     outputs:
-      sha256: ${{ steps.bundle.outputs.sha256 }}
-      tag:    ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
 
-      - name: Resolve tag
-        id: tag
+      - name: Validate version and model
+        id: version
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-          fi
-          if [ -z "$TAG" ]; then
-            echo "could not resolve a tag" >&2
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          if [[ "${TAG}" != "v${version}" ]]; then
+            echo "requested tag ${TAG} does not match Cargo version ${version}" >&2
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Resolved release tag: $TAG"
+          if existing=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            if [[ "${existing}" != "${GITHUB_SHA}" ]]; then
+              echo "tag ${TAG} already points to ${existing}, not ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          fi
+          scripts/check-model.sh
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Create + push tag (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag "$TAG"
-          git push origin "$TAG"
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify embedded model
+        run: scripts/check-model.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      - name: cargo build release
-        run: cargo build --release --locked --target aarch64-apple-darwin
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
-      - name: bundle tarball
-        id: bundle
+      - name: Package release archive
+        run: |
+          scripts/package-release.sh \
+            "${{ matrix.target }}" \
+            "target/${{ matrix.target }}/release/da" \
+            tmp/dist
+
+      - name: Smoke-test extracted archive
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          DIST=da-aarch64-apple-darwin
-          TARGET_BIN=target/aarch64-apple-darwin/release
+          smoke_root="${RUNNER_TEMP}/da-smoke-${TARGET}"
+          mkdir -p "${smoke_root}"
+          tar -C "${smoke_root}" -xzf "tmp/dist/da-${TARGET}.tar.gz"
+          scripts/smoke-release.sh \
+            "${smoke_root}/da-${TARGET}/bin/da" \
+            "${TARGET}" \
+            "${VERSION}"
 
-          mkdir -p "$DIST/bin" "$DIST/share/da"
-          cp "$TARGET_BIN/da" "$DIST/bin/da"
-          cp LICENSE README.md "$DIST/share/da/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            tmp/dist/da-${{ matrix.target }}.tar.gz
+            tmp/dist/da-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
 
-          tar -czf "$DIST.tar.gz" "$DIST"
-          SHA256=$(shasum -a 256 "$DIST.tar.gz" | awk '{print $1}')
-          printf '%s  %s\n' "$SHA256" "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-          echo "tarball=$DIST.tar.gz"   >> "$GITHUB_OUTPUT"
-          echo "sha256_file=$DIST.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-          echo "sha256=$SHA256"          >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
 
-      - name: gh release
+      - name: Verify complete artifact set
+        run: |
+          set -euo pipefail
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu
+          do
+            test -f "dist/da-${target}.tar.gz"
+            test -f "dist/da-${target}.tar.gz.sha256"
+            (cd dist && shasum -a 256 -c "da-${target}.tar.gz.sha256")
+          done
+
+      - name: Create tag after successful builds
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if existing=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            test "${existing}" = "${GITHUB_SHA}"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "${TAG}" "${GITHUB_SHA}"
+            git push origin "${TAG}"
+          fi
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.validate.outputs.tag }}
           files: |
-            ${{ steps.bundle.outputs.tarball }}
-            ${{ steps.bundle.outputs.sha256_file }}
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: cargo publish (crates.io)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # --allow-dirty: the prior `bundle tarball` step leaves CI artifacts
-        # (tarball + dist dir) in the working tree; they aren't part of the
-        # crate source.
-        run: cargo publish --locked --no-verify --allow-dirty
 
   update-tap:
-    needs: release
-    runs-on: ubuntu-latest
+    needs: [validate, publish]
+    runs-on: ubuntu-22.04
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-aarch64-apple-darwin
+          path: dist
+
+      - name: Read Apple ARM64 checksum
+        id: checksum
+        run: |
+          sha256=$(awk '{ print $1 }' dist/da-aarch64-apple-darwin.tar.gz.sha256)
+          echo "sha256=${sha256}" >> "${GITHUB_OUTPUT}"
+
       - name: Checkout tap
         uses: actions/checkout@v4
         with:
@@ -112,25 +185,24 @@ jobs:
 
       - name: Update Formula/da.rb
         env:
-          SHA256: ${{ needs.release.outputs.sha256 }}
-          TAG:    ${{ needs.release.outputs.tag }}
+          SHA256: ${{ steps.checksum.outputs.sha256 }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          VERSION="${TAG#v}"
-          URL="https://github.com/amenocturne/da/releases/download/${TAG}/da-aarch64-apple-darwin.tar.gz"
-          sed -i "s|^  url \".*\"|  url \"$URL\"|"           Formula/da.rb
-          sed -i "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|"  Formula/da.rb
-          sed -i "s|^  version \".*\"|  version \"$VERSION\"|" Formula/da.rb
+          version="${TAG#v}"
+          url="https://github.com/amenocturne/da/releases/download/${TAG}/da-aarch64-apple-darwin.tar.gz"
+          sed -i "s|^  url \".*\"|  url \"${url}\"|" Formula/da.rb
+          sed -i "s|^  sha256 \".*\"|  sha256 \"${SHA256}\"|" Formula/da.rb
+          sed -i "s|^  version \".*\"|  version \"${version}\"|" Formula/da.rb
 
-      - name: Commit + push
+      - name: Commit and push tap update
         env:
-          TAG: ${{ needs.release.outputs.tag }}
+          TAG: ${{ needs.validate.outputs.tag }}
         run: |
           set -euo pipefail
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git diff --quiet Formula/da.rb; then
-            echo "No formula changes; skipping commit."
             exit 0
           fi
           git commit -am "Bump da to ${TAG}"

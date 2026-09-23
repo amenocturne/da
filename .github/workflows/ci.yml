@@ -15,6 +15,11 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify embedded model
+        run: scripts/check-model.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -1,5 +1,7 @@
 /target
 /result
+/tmp
+/.worktrees
 Cargo.lock.bak
 *.swp
 .DS_Store
